@@ -31,6 +31,7 @@ import org.reactivestreams.Publisher;
 import reactor.core.publisher.Mono;
 import reactor.netty.Connection;
 import reactor.netty.http.server.HttpServer;
+import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerRoutes;
 import reactor.netty.http.server.WebsocketServerSpec;
 import reactor.netty.http.websocket.WebsocketInbound;
@@ -77,6 +78,34 @@ public final class WebsocketRouteTransport extends BaseWebsocketServerTransport<
             })
         .bind()
         .map(CloseableChannel::new);
+  }
+
+  public static HttpServerRoutes addRoutes(
+      HttpServerRoutes routes, String path, ConnectionAcceptor acceptor) {
+    final UriPathTemplate template = new UriPathTemplate(path);
+    return addRoutes(
+        routes,
+        hsr -> hsr.method().equals(HttpMethod.GET) && template.matches(hsr.uri()),
+        acceptor,
+        0);
+  }
+
+  public static HttpServerRoutes addRoutes(
+      HttpServerRoutes routes, String path, ConnectionAcceptor acceptor, int mtu) {
+    final UriPathTemplate template = new UriPathTemplate(path);
+    return addRoutes(
+        routes,
+        hsr -> hsr.method().equals(HttpMethod.GET) && template.matches(hsr.uri()),
+        acceptor,
+        mtu);
+  }
+
+  public static HttpServerRoutes addRoutes(
+      HttpServerRoutes routes,
+      Predicate<? super HttpServerRequest> condition,
+      ConnectionAcceptor acceptor,
+      int mtu) {
+    return routes.ws(condition, newHandler(acceptor, mtu), null, FRAME_LENGTH_MASK);
   }
 
   /**
