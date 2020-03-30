@@ -19,9 +19,9 @@ package io.rsocket.transport.netty.server;
 import static io.rsocket.frame.FrameLengthFlyweight.FRAME_LENGTH_MASK;
 
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.handler.codec.http.HttpMethod;
 import io.rsocket.Closeable;
 import io.rsocket.DuplexConnection;
-import io.rsocket.fragmentation.FragmentationDuplexConnection;
 import io.rsocket.transport.ServerTransport;
 import io.rsocket.transport.netty.WebsocketDuplexConnection;
 import java.util.Objects;
@@ -64,7 +64,7 @@ public final class WebsocketRouteTransport extends BaseWebsocketServerTransport<
   }
 
   @Override
-  public Mono<Closeable> start(ConnectionAcceptor acceptor, int mtu) {
+  public Mono<Closeable> start(ConnectionAcceptor acceptor) {
     Objects.requireNonNull(acceptor, "acceptor must not be null");
 
     return server
@@ -73,7 +73,7 @@ public final class WebsocketRouteTransport extends BaseWebsocketServerTransport<
               routesBuilder.accept(routes);
               routes.ws(
                   path,
-                  newHandler(acceptor, mtu),
+                  newHandler(acceptor),
                   WebsocketServerSpec.builder().maxFramePayloadLength(FRAME_LENGTH_MASK).build());
             })
         .bind()
@@ -86,26 +86,14 @@ public final class WebsocketRouteTransport extends BaseWebsocketServerTransport<
     return addRoutes(
         routes,
         hsr -> hsr.method().equals(HttpMethod.GET) && template.matches(hsr.uri()),
-        acceptor,
-        0);
-  }
-
-  public static HttpServerRoutes addRoutes(
-      HttpServerRoutes routes, String path, ConnectionAcceptor acceptor, int mtu) {
-    final UriPathTemplate template = new UriPathTemplate(path);
-    return addRoutes(
-        routes,
-        hsr -> hsr.method().equals(HttpMethod.GET) && template.matches(hsr.uri()),
-        acceptor,
-        mtu);
+        acceptor);
   }
 
   public static HttpServerRoutes addRoutes(
       HttpServerRoutes routes,
       Predicate<? super HttpServerRequest> condition,
-      ConnectionAcceptor acceptor,
-      int mtu) {
-    return routes.ws(condition, newHandler(acceptor, mtu), null, FRAME_LENGTH_MASK);
+      ConnectionAcceptor acceptor) {
+    return routes.ws(condition, newHandler(acceptor), null, FRAME_LENGTH_MASK);
   }
 
   /**
@@ -117,26 +105,8 @@ public final class WebsocketRouteTransport extends BaseWebsocketServerTransport<
    */
   public static BiFunction<WebsocketInbound, WebsocketOutbound, Publisher<Void>> newHandler(
       ConnectionAcceptor acceptor) {
-    return newHandler(acceptor, 0);
-  }
-
-  /**
-   * Creates a new Websocket handler
-   *
-   * @param acceptor the {@link ConnectionAcceptor} to use with the handler
-   * @param mtu the fragment size
-   * @return a new Websocket handler
-   * @throws NullPointerException if {@code acceptor} is {@code null}
-   */
-  public static BiFunction<WebsocketInbound, WebsocketOutbound, Publisher<Void>> newHandler(
-      ConnectionAcceptor acceptor, int mtu) {
     return (in, out) -> {
       DuplexConnection connection = new WebsocketDuplexConnection((Connection) in);
-      if (mtu > 0) {
-        connection =
-            new FragmentationDuplexConnection(
-                connection, ByteBufAllocator.DEFAULT, mtu, false, "server");
-      }
       return acceptor.apply(connection).then(out.neverComplete());
     };
   }
