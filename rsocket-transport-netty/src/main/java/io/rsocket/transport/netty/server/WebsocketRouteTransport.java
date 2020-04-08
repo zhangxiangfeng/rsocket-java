@@ -18,8 +18,6 @@ package io.rsocket.transport.netty.server;
 
 import static io.rsocket.frame.FrameLengthFlyweight.FRAME_LENGTH_MASK;
 
-import io.netty.buffer.ByteBufAllocator;
-import io.netty.handler.codec.http.HttpMethod;
 import io.rsocket.Closeable;
 import io.rsocket.DuplexConnection;
 import io.rsocket.transport.ServerTransport;
@@ -31,7 +29,6 @@ import org.reactivestreams.Publisher;
 import reactor.core.publisher.Mono;
 import reactor.netty.Connection;
 import reactor.netty.http.server.HttpServer;
-import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerRoutes;
 import reactor.netty.http.server.WebsocketServerSpec;
 import reactor.netty.http.websocket.WebsocketInbound;
@@ -82,18 +79,10 @@ public final class WebsocketRouteTransport extends BaseWebsocketServerTransport<
 
   public static HttpServerRoutes addRoutes(
       HttpServerRoutes routes, String path, ConnectionAcceptor acceptor) {
-    final UriPathTemplate template = new UriPathTemplate(path);
-    return addRoutes(
-        routes,
-        hsr -> hsr.method().equals(HttpMethod.GET) && template.matches(hsr.uri()),
-        acceptor);
-  }
-
-  public static HttpServerRoutes addRoutes(
-      HttpServerRoutes routes,
-      Predicate<? super HttpServerRequest> condition,
-      ConnectionAcceptor acceptor) {
-    return routes.ws(condition, newHandler(acceptor), null, FRAME_LENGTH_MASK);
+    return routes.ws(
+        path,
+        newHandler(acceptor),
+        WebsocketServerSpec.builder().maxFramePayloadLength(FRAME_LENGTH_MASK).build());
   }
 
   /**

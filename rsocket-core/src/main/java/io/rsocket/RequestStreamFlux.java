@@ -40,10 +40,23 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
   final UnboundedProcessor<ByteBuf> sendProcessor;
   final PayloadDecoder payloadDecoder;
 
-  static final long STATE_UNSUBSCRIBED = -2;
-  static final long STATE_SUBSCRIBED = -1;
-  static final long STATE_REQUESTED_MAX = -3;
-  static final long STATE_TERMINATED = Long.MIN_VALUE;
+  static final long FLAG_REASSEMBLY =
+      0b0_1__00000000000000000000000000000000000000000000000000000000000000L;
+  static final long FLAG_INVERT_REASSEMBLY = ~FLAG_REASSEMBLY;
+
+  static final long MASK_REQUESTED =
+      0b0_0__11111111111111111111111111111111111111111111111111111111111111L;
+  static final long MASK_REQUESTED_MAX =
+      0b1_0__10000000000000000000000000000000000000000000000000000000000000L;
+  static final long MASK_FLAGS =
+      0b1_1__00000000000000000000000000000000000000000000000000000000000000L;
+
+  static final long STATE_UNSUBSCRIBED =
+      0b1_0000000000000000000000000000000000000000000000000000000000000__10L;
+  static final long STATE_SUBSCRIBED =
+      0b1_0000000000000000000000000000000000000000000000000000000000000__01L;
+  static final long STATE_TERMINATED =
+      0b1_0__00000000000000000000000000000000000000000000000000000000000000L;
 
   volatile long requested;
   static final AtomicLongFieldUpdater<RequestStreamFlux> REQUESTED =
@@ -182,31 +195,39 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
       return;
     }
 
+    long state;
     long currentRequested;
     long nextRequested;
     for (; ; ) {
-      currentRequested = this.requested;
+      state = this.requested;
 
-      if (currentRequested == STATE_REQUESTED_MAX) {
+      if (state == STATE_TERMINATED) {
         return;
       }
 
-      if (currentRequested == Long.MAX_VALUE) {
-        return;
-      }
+      if (state == STATE_SUBSCRIBED) {
+        currentRequested = 0;
+        nextRequested = Math.min(n, MASK_REQUESTED);
 
-      if (currentRequested == STATE_TERMINATED) {
-        return;
-      }
-
-      if (currentRequested == STATE_SUBSCRIBED) {
-        nextRequested = n;
+        if (REQUESTED.compareAndSet(this, state, nextRequested)) {
+          break;
+        }
       } else {
-        nextRequested = Operators.addCap(currentRequested, n);
-      }
+        // first request has happened with Long.MAX_VALUE
+        if ((state & MASK_REQUESTED_MAX) == MASK_REQUESTED_MAX) {
+          return;
+        }
 
-      if (REQUESTED.compareAndSet(this, currentRequested, nextRequested)) {
-        break;
+        // racing on request(Long.MAX) and request(Long.MAX)
+        if ((currentRequested = (state & MASK_REQUESTED)) == MASK_REQUESTED) {
+          return;
+        }
+
+        nextRequested = Math.min(Operators.addCap(currentRequested, n), MASK_REQUESTED);
+
+        if (REQUESTED.compareAndSet(this, state, nextRequested | (state & MASK_FLAGS))) {
+          break;
+        }
       }
     }
 
@@ -220,7 +241,7 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
     int streamId = this.streamId;
 
     for (; ; ) {
-      if (currentRequested == STATE_SUBSCRIBED) {
+      if (state == STATE_SUBSCRIBED) {
         final Throwable throwable = this.parent.checkAvailable();
         if (throwable != null) {
           this.payload.release();
@@ -249,7 +270,7 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
                 FragmentationUtils.encodeFirstFragment(
                     allocator,
                     mtu,
-                    (int) (nextRequested & Integer.MAX_VALUE),
+                    (int) Math.min(nextRequested, Integer.MAX_VALUE),
                     FrameType.REQUEST_STREAM,
                     streamId,
                     slicedMetadata,
@@ -273,7 +294,7 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
                     allocator,
                     streamId,
                     false,
-                    (int) (nextRequested & Integer.MAX_VALUE),
+                    (int) Math.min(nextRequested, Integer.MAX_VALUE),
                     retainedSlicedMetadata,
                     retainedSlicedData);
 
@@ -283,6 +304,7 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
 
           p.release();
         } catch (Throwable e) {
+          this.done = true;
           this.requested = STATE_TERMINATED;
 
           ReferenceCountUtil.safeRelease(p);
@@ -306,36 +328,36 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
       for (; ; ) {
         long toUpdate;
         // now currentRequested is newer than nextRequested
-        currentRequested = this.requested;
+        state = this.requested;
 
-        if (currentRequested == STATE_TERMINATED) {
+        if (state == STATE_TERMINATED) {
           // we should not override terminal state
           nextRequested = STATE_TERMINATED;
           break;
         }
 
-        if (nextRequested == Long.MAX_VALUE) {
+        if (nextRequested == MASK_REQUESTED) {
           // we should state that it max value has already been requested, so no need to loop
           // anymore
-          toUpdate = STATE_REQUESTED_MAX;
+          toUpdate = MASK_REQUESTED_MAX;
         } else {
           // subtract the requestN from the latest requested state
+          currentRequested = state & MASK_REQUESTED;
           toUpdate = currentRequested - nextRequested;
         }
 
-        if (REQUESTED.compareAndSet(this, currentRequested, toUpdate)) {
+        if (REQUESTED.compareAndSet(this, state, toUpdate | (state & MASK_FLAGS))) {
           nextRequested = toUpdate;
           break;
         }
       }
 
-      if (nextRequested == STATE_REQUESTED_MAX) {
-        return;
-      }
-
+      // was terminated while looping. Need to check is was cancelled
       if (nextRequested == STATE_TERMINATED) {
-        // if terminated because of cancellation
+        // done is false if was terminated because of cancellation
         if (!this.done) {
+          this.activeSubscribers.remove(streamId, this);
+
           final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
           sender.onNext(cancelFrame);
         }
@@ -343,9 +365,17 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
         return;
       }
 
+      // already requested max. No need to do anything else
+      if (nextRequested == MASK_REQUESTED_MAX) {
+        return;
+      }
+
+      // all good, just exit
       if (nextRequested == 0) {
         return;
       }
+
+      // repeat, because was requested more while we were sending frame
     }
   }
 
@@ -355,20 +385,23 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
       return;
     }
 
-    final CompositeByteBuf frames = this.frames;
-    this.frames = null;
-
     final long state = REQUESTED.getAndSet(this, STATE_TERMINATED);
     if (state != STATE_TERMINATED) {
-      final int streamId = this.streamId;
-      this.activeSubscribers.remove(streamId, this);
 
       if (state == STATE_SUBSCRIBED) {
         // no need to send anything, since the first request has not happened
         this.payload.release();
-      } else if (state == 0 || state == STATE_REQUESTED_MAX) {
+        return;
+      }
+
+      if ((state & MASK_REQUESTED) == 0 || (state & MASK_REQUESTED_MAX) == MASK_REQUESTED_MAX) {
+        final int streamId = this.streamId;
+        this.activeSubscribers.remove(streamId, this);
+
+        final CompositeByteBuf frames = this.frames;
+        this.frames = null;
         if (frames != null && frames.refCnt() > 0) {
-          frames.release();
+          ReferenceCountUtil.safeRelease(frames);
         }
 
         final ByteBuf cancelFrame = CancelFrameFlyweight.encode(this.allocator, streamId);
@@ -393,18 +426,37 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
     if (frames == null) {
       frames = ReassemblyUtils.addFollowingFrame(this.allocator.compositeBuffer(), followingFrame);
       this.frames = frames;
-      if (this.requested == STATE_TERMINATED) {
-        this.frames = null;
-        ReferenceCountUtil.safeRelease(frames);
-        return;
+
+      for (; ; ) {
+        long state = this.requested;
+
+        if (state == STATE_TERMINATED) {
+          this.frames = null;
+          ReferenceCountUtil.safeRelease(frames);
+        }
+
+        if (REQUESTED.compareAndSet(this, state, state | FLAG_REASSEMBLY)) {
+          return;
+        }
       }
-      return;
     } else {
       frames = ReassemblyUtils.addFollowingFrame(frames, followingFrame);
     }
 
     if (!hasFollows) {
       this.frames = null;
+      for (; ; ) {
+        long state = this.requested;
+
+        if (state == STATE_TERMINATED) {
+          ReferenceCountUtil.safeRelease(frames);
+          return;
+        }
+
+        if (REQUESTED.compareAndSet(this, state, state & FLAG_INVERT_REASSEMBLY)) {
+          break;
+        }
+      }
       try {
         this.onNext(this.payloadDecoder.apply(frames));
         frames.release();

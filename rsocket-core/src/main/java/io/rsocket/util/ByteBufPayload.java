@@ -16,11 +16,13 @@
 
 package io.rsocket.util;
 
+import io.netty.buffer.AbstractByteBuf;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.Unpooled;
 import io.netty.util.AbstractReferenceCounted;
+import io.netty.util.IllegalReferenceCountException;
 import io.netty.util.Recycler;
 import io.netty.util.Recycler.Handle;
 import io.rsocket.Payload;
@@ -126,26 +128,31 @@ public final class ByteBufPayload extends AbstractReferenceCounted implements Pa
 
   @Override
   public boolean hasMetadata() {
+    ensureAccessible();
     return metadata != null;
   }
 
   @Override
   public ByteBuf sliceMetadata() {
+    ensureAccessible();
     return metadata == null ? Unpooled.EMPTY_BUFFER : metadata.slice();
   }
 
   @Override
   public ByteBuf data() {
+    ensureAccessible();
     return data;
   }
 
   @Override
   public ByteBuf metadata() {
+    ensureAccessible();
     return metadata == null ? Unpooled.EMPTY_BUFFER : metadata;
   }
 
   @Override
   public ByteBuf sliceData() {
+    ensureAccessible();
     return data.slice();
   }
 
@@ -163,6 +170,7 @@ public final class ByteBufPayload extends AbstractReferenceCounted implements Pa
 
   @Override
   public ByteBufPayload touch() {
+    ensureAccessible();
     data.touch();
     if (metadata != null) {
       metadata.touch();
@@ -188,5 +196,23 @@ public final class ByteBufPayload extends AbstractReferenceCounted implements Pa
       metadata = null;
     }
     handle.recycle(this);
+  }
+
+  /**
+   * Should be called by every method that tries to access the buffers content to check if the
+   * buffer was released before.
+   */
+  protected final void ensureAccessible() {
+    if (!isAccessible()) {
+      throw new IllegalReferenceCountException(0);
+    }
+  }
+
+  /**
+   * Used internally by {@link AbstractByteBuf#ensureAccessible()} to try to guard against using the
+   * buffer after it was released (best-effort).
+   */
+  boolean isAccessible() {
+    return refCnt() != 0;
   }
 }

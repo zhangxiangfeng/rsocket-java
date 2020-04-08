@@ -122,9 +122,7 @@ public final class WebsocketServerTransport extends BaseWebsocketServerTransport
                     DuplexConnection connection = new WebsocketDuplexConnection((Connection) in);
                     return acceptor.apply(connection).then(out.neverComplete());
                   },
-                      WebsocketServerSpec.builder()
-                              .maxFramePayloadLength(FRAME_LENGTH_MASK)
-                              .build());
+                  WebsocketServerSpec.builder().maxFramePayloadLength(FRAME_LENGTH_MASK).build());
             })
         .bind()
         .map(CloseableChannel::new);

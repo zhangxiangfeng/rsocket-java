@@ -390,6 +390,71 @@ public class RequestResponseMonoTest {
                 .isInstanceOf(IllegalReferenceCountException.class));
   }
 
+  @Test
+  public void shouldErrorOnIncorrectRefCntInGivenPayloadLatePhase() {
+    final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+    final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+    final Payload payload = ByteBufPayload.create("");
+
+    final RequestResponseMono requestResponseMono =
+        new RequestResponseMono(
+            ByteBufAllocator.DEFAULT,
+            payload,
+            0,
+            RequestStreamFluxTest.TestStateAware.empty(),
+            StreamIdSupplier.clientSupplier(),
+            activeStreams,
+            sender,
+            PayloadDecoder.ZERO_COPY);
+
+    Assertions.assertThat(activeStreams).isEmpty();
+
+    StepVerifier.create(requestResponseMono, 0)
+        .expectSubscription()
+        .then(payload::release)
+        .thenRequest(1)
+        .expectError(IllegalReferenceCountException.class)
+        .verify();
+
+    Assertions.assertThat(activeStreams).isEmpty();
+    Assertions.assertThat(sender.isEmpty()).isTrue();
+  }
+
+  @Test
+  public void shouldErrorOnIncorrectRefCntInGivenPayloadLatePhaseWithFragmentation() {
+    final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+    final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+    final byte[] metadata = new byte[65];
+    final byte[] data = new byte[129];
+    ThreadLocalRandom.current().nextBytes(metadata);
+    ThreadLocalRandom.current().nextBytes(data);
+
+    final Payload payload = ByteBufPayload.create(data, metadata);
+
+    final RequestResponseMono requestResponseMono =
+        new RequestResponseMono(
+            ByteBufAllocator.DEFAULT,
+            payload,
+            64,
+            RequestStreamFluxTest.TestStateAware.empty(),
+            StreamIdSupplier.clientSupplier(),
+            activeStreams,
+            sender,
+            PayloadDecoder.ZERO_COPY);
+
+    Assertions.assertThat(activeStreams).isEmpty();
+
+    StepVerifier.create(requestResponseMono, 0)
+        .expectSubscription()
+        .then(payload::release)
+        .thenRequest(1)
+        .expectError(IllegalReferenceCountException.class)
+        .verify();
+
+    Assertions.assertThat(activeStreams).isEmpty();
+    Assertions.assertThat(sender.isEmpty()).isTrue();
+  }
+
   @ParameterizedTest
   @MethodSource("shouldErrorIfFragmentExitsAllowanceIfFragmentationDisabledSource")
   public void shouldErrorIfFragmentExitsAllowanceIfFragmentationDisabled(
@@ -622,7 +687,7 @@ public class RequestResponseMonoTest {
 
       requestResponseMono.onNext(response);
 
-      assertSubscriber.isTerminated();
+      assertSubscriber.assertTerminated();
 
       Assertions.assertThat(sentFrame.release()).isTrue();
       Assertions.assertThat(sentFrame.refCnt()).isZero();
@@ -693,6 +758,9 @@ public class RequestResponseMonoTest {
 
       Assertions.assertThat(activeStreams).isEmpty();
       Assertions.assertThat(sender.isEmpty()).isTrue();
+
+      Assertions.assertThat(requestResponseMono.state)
+          .isEqualTo(RequestResponseMono.STATE_TERMINATED);
     }
   }
 
@@ -753,6 +821,147 @@ public class RequestResponseMonoTest {
             .hasClientSideStreamId()
             .hasStreamId(1);
       }
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+
+      Assertions.assertThat(requestResponseMono.state)
+          .isEqualTo(RequestResponseMono.STATE_TERMINATED);
+    }
+  }
+
+  @Test
+  public void shouldBeConsistentInCaseOfRacingOfCancellationAndRequest() {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestResponseMono requestResponseMono =
+          new RequestResponseMono(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              RequestStreamFluxTest.TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestResponseMono.subscribeWith(new AssertSubscriber<>(0));
+
+      RaceTestUtils.race(() -> assertSubscriber.cancel(), () -> assertSubscriber.request(1));
+
+      if (!sender.isEmpty()) {
+        final ByteBuf sentFrame = sender.poll();
+        FrameAssert.assertThat(sentFrame)
+            .isNotNull()
+            .typeOf(FrameType.REQUEST_RESPONSE)
+            .hasPayloadSize(
+                "testData".getBytes(CharsetUtil.UTF_8).length
+                    + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+            .hasMetadata("testMetadata")
+            .hasData("testData")
+            .hasNoFragmentsFollow()
+            .hasClientSideStreamId()
+            .hasStreamId(1);
+
+        Assertions.assertThat(sentFrame.release()).isTrue();
+        Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+        final ByteBuf cancelFrame = sender.poll();
+        FrameAssert.assertThat(cancelFrame)
+            .isNotNull()
+            .typeOf(FrameType.CANCEL)
+            .hasClientSideStreamId()
+            .hasStreamId(1);
+
+        Assertions.assertThat(cancelFrame.release()).isTrue();
+        Assertions.assertThat(cancelFrame.refCnt()).isZero();
+      }
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+
+      Assertions.assertThat(requestResponseMono.state)
+          .isEqualTo(RequestResponseMono.STATE_TERMINATED);
+
+      requestResponseMono.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      Assertions.assertThat(activeStreams).isEmpty();
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+    }
+  }
+
+  @Test
+  public void shouldSentCancelFrameExactlyOnce() {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestResponseMono requestResponseMono =
+          new RequestResponseMono(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              RequestStreamFluxTest.TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestResponseMono.subscribeWith(new AssertSubscriber<>(0));
+
+      assertSubscriber.request(1);
+
+      final ByteBuf sentFrame = sender.poll();
+      FrameAssert.assertThat(sentFrame)
+          .isNotNull()
+          .hasNoFragmentsFollow()
+          .typeOf(FrameType.REQUEST_RESPONSE)
+          .hasClientSideStreamId()
+          .hasPayloadSize(
+              "testData".getBytes(CharsetUtil.UTF_8).length
+                  + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+          .hasMetadata("testMetadata")
+          .hasData("testData")
+          .hasStreamId(1);
+
+      Assertions.assertThat(sentFrame.release()).isTrue();
+      Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+      RaceTestUtils.race(requestResponseMono::cancel, requestResponseMono::cancel);
+
+      final ByteBuf cancelFrame = sender.poll();
+      FrameAssert.assertThat(cancelFrame)
+          .isNotNull()
+          .typeOf(FrameType.CANCEL)
+          .hasClientSideStreamId()
+          .hasStreamId(1);
+
+      Assertions.assertThat(cancelFrame.release()).isTrue();
+      Assertions.assertThat(cancelFrame.refCnt()).isZero();
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+      Assertions.assertThat(activeStreams).isEmpty();
+
+      Assertions.assertThat(requestResponseMono.state)
+          .isEqualTo(RequestResponseMono.STATE_TERMINATED);
+
+      requestResponseMono.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      requestResponseMono.onComplete();
+      assertSubscriber.assertNotTerminated();
+
+      Assertions.assertThat(activeStreams).isEmpty();
       Assertions.assertThat(sender.isEmpty()).isTrue();
     }
   }

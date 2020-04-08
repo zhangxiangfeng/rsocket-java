@@ -179,7 +179,7 @@ final class RequestChannelFlux extends Flux<Payload>
                   FragmentationUtils.encodeFirstFragment(
                       allocator,
                       mtu,
-                      (int) (requested & Integer.MAX_VALUE),
+                      (int) Math.min(requested, Integer.MAX_VALUE),
                       FrameType.REQUEST_CHANNEL,
                       streamId,
                       slicedMetadata,
@@ -211,7 +211,7 @@ final class RequestChannelFlux extends Flux<Payload>
                       false,
                       false, // TODO: Should be a different flag in case of the scalar source or
                       // sync source of a single element
-                      (int) (requested & Integer.MAX_VALUE),
+                      (int) Math.min(requested, Integer.MAX_VALUE),
                       retainedSlicedMetadata,
                       retainedSlicedData);
 

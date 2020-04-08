@@ -39,11 +39,13 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
   final UnboundedProcessor<ByteBuf> sendProcessor;
   final PayloadDecoder payloadDecoder;
 
-  static final int STATE_UNSUBSCRIBED = 0;
-  static final int STATE_SUBSCRIBED = 1;
-  static final int STATE_REQUESTED = 2;
-  static final int STATE_REASSEMBLING = 3;
-  static final int STATE_TERMINATED = 4;
+  static final int STATE_UNSUBSCRIBED = 0b0_0000;
+  static final int STATE_SUBSCRIBED = 0b0_0001;
+  static final int STATE_REQUESTED = 0b0_0010;
+  static final int STATE_TERMINATED = 0b1_0000;
+
+  static final int FLAG_SENT = 0b0_0100;
+  static final int FLAG_REASSEMBLING = 0b0_1000;
 
   volatile int state;
   static final AtomicIntegerFieldUpdater<RequestResponseMono> STATE =
@@ -52,6 +54,7 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
   int streamId;
   CoreSubscriber<? super Payload> actual;
   CompositeByteBuf frames;
+  boolean done;
 
   RequestResponseMono(
       ByteBufAllocator allocator,
@@ -98,13 +101,14 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
 
   @Override
   public final void onError(Throwable cause) {
-    if (this.state == STATE_TERMINATED) {
+    if (this.state == STATE_TERMINATED || this.done) {
       Operators.onErrorDropped(cause, currentContext());
       return;
     }
 
     final CompositeByteBuf frames = this.frames;
     this.frames = null;
+    this.done = true;
 
     if (STATE.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
       Operators.onErrorDropped(cause, currentContext());
@@ -122,8 +126,16 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
 
   @Override
   public final void onNext(@Nullable Payload value) {
-    if (this.state == STATE_TERMINATED
-        || STATE.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
+    if (this.state == STATE_TERMINATED || this.done) {
+      if (value != null) {
+        value.release();
+      }
+      return;
+    }
+
+    this.done = true;
+
+    if (STATE.getAndSet(this, STATE_TERMINATED) == STATE_TERMINATED) {
       if (value != null) {
         value.release();
       }
@@ -229,6 +241,7 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
 
         p.release();
       } catch (Throwable e) {
+        this.done = true;
         this.state = STATE_TERMINATED;
 
         ReferenceCountUtil.safeRelease(p);
@@ -241,21 +254,39 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
         }
 
         this.actual.onError(e);
+        return;
+      }
+
+      for (; ; ) {
+        int state = this.state;
+
+        if (state == STATE_TERMINATED) {
+          if (!this.done) {
+            final int streamId = this.streamId;
+            as.remove(streamId, this);
+
+            final ByteBuf cancelFrame = CancelFrameFlyweight.encode(allocator, streamId);
+            sender.onNext(cancelFrame);
+          }
+
+          return;
+        }
+
+        if (STATE.compareAndSet(this, state, state | FLAG_SENT)) {
+          return;
+        }
       }
     }
   }
 
   @Override
   public final void cancel() {
-    int state = this.state;
-    if (state == STATE_TERMINATED) {
-      return;
-    }
+    int state = STATE.getAndSet(this, STATE_TERMINATED);
 
-    if (STATE.getAndSet(this, STATE_TERMINATED) != STATE_TERMINATED) {
+    if (state != STATE_TERMINATED) {
       if (state == STATE_SUBSCRIBED) {
         this.payload.release();
-      } else {
+      } else if ((state & FLAG_SENT) == FLAG_SENT) {
 
         final CompositeByteBuf frames = this.frames;
         this.frames = null;
@@ -292,9 +323,10 @@ final class RequestResponseMono extends Mono<Payload> implements Reassemble<Payl
         if (state == STATE_TERMINATED) {
           this.frames = null;
           ReferenceCountUtil.safeRelease(frames);
+          return;
         }
 
-        if (STATE.compareAndSet(this, state, STATE_REASSEMBLING)) {
+        if (STATE.compareAndSet(this, state, state | FLAG_REASSEMBLING)) {
           return;
         }
       }

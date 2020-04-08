@@ -1,5 +1,9 @@
 package io.rsocket;
 
+import static io.rsocket.RequestStreamFlux.FLAG_REASSEMBLY;
+import static io.rsocket.RequestStreamFlux.MASK_REQUESTED;
+import static io.rsocket.RequestStreamFlux.MASK_REQUESTED_MAX;
+
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.Unpooled;
@@ -21,11 +25,13 @@ import java.util.Arrays;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.stream.Stream;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import reactor.core.Exceptions;
 import reactor.core.Scannable;
@@ -62,11 +68,17 @@ public class RequestStreamFluxTest {
         requestStreamFlux.subscribeWith(AssertSubscriber.create(0));
     Assertions.assertThat(payload.refCnt()).isOne();
     Assertions.assertThat(activeStreams).isEmpty();
+    // state machine check
+    Assertions.assertThat(requestStreamFlux.requested)
+        .isEqualTo(RequestStreamFlux.STATE_SUBSCRIBED);
 
     assertSubscriber.request(1);
 
     Assertions.assertThat(payload.refCnt()).isZero();
     Assertions.assertThat(activeStreams).containsEntry(1, requestStreamFlux);
+
+    // state machine check
+    Assertions.assertThat(requestStreamFlux.requested).isZero();
 
     final ByteBuf frame = sender.poll();
     FrameAssert.assertThat(frame)
@@ -84,6 +96,9 @@ public class RequestStreamFluxTest {
 
     Assertions.assertThat(sender.isEmpty()).isTrue();
 
+    Assertions.assertThat(frame.release()).isTrue();
+    Assertions.assertThat(frame.refCnt()).isZero();
+
     assertSubscriber.request(1);
     final ByteBuf requestNFrame = sender.poll();
     FrameAssert.assertThat(requestNFrame)
@@ -95,86 +110,117 @@ public class RequestStreamFluxTest {
 
     Assertions.assertThat(sender.isEmpty()).isTrue();
 
+    Assertions.assertThat(requestNFrame.release()).isTrue();
+    Assertions.assertThat(requestNFrame.refCnt()).isZero();
+
+    // state machine check
+    Assertions.assertThat(requestStreamFlux.requested).isZero();
+
+    assertSubscriber.request(Long.MAX_VALUE);
+    final ByteBuf requestMaxNFrame = sender.poll();
+    FrameAssert.assertThat(requestMaxNFrame)
+        .isNotNull()
+        .hasRequestN(Integer.MAX_VALUE)
+        .typeOf(FrameType.REQUEST_N)
+        .hasClientSideStreamId()
+        .hasStreamId(1);
+
+    Assertions.assertThat(sender.isEmpty()).isTrue();
+
+    Assertions.assertThat(requestMaxNFrame.release()).isTrue();
+    Assertions.assertThat(requestMaxNFrame.refCnt()).isZero();
+
+    // state machine check
+    Assertions.assertThat(requestStreamFlux.requested)
+        .isEqualTo(RequestStreamFlux.MASK_REQUESTED_MAX);
+
+    assertSubscriber.request(6);
+    Assertions.assertThat(sender.isEmpty()).isTrue();
+
+    // state machine check
+    Assertions.assertThat(requestStreamFlux.requested)
+        .isEqualTo(RequestStreamFlux.MASK_REQUESTED_MAX);
+
+    requestStreamFlux.reassemble(Unpooled.EMPTY_BUFFER, true, false);
+
+    // state machine check
+    Assertions.assertThat(requestStreamFlux.requested)
+        .matches(
+            state ->
+                (state & RequestStreamFlux.MASK_REQUESTED_MAX)
+                    == RequestStreamFlux.MASK_REQUESTED_MAX)
+        .isEqualTo(RequestStreamFlux.MASK_REQUESTED_MAX | FLAG_REASSEMBLY);
+
     requestStreamFlux.onNext(EmptyPayload.INSTANCE);
 
     requestStreamFlux.onComplete();
-
     assertSubscriber.assertValues(EmptyPayload.INSTANCE).assertComplete();
-
-    Assertions.assertThat(frame.release()).isTrue();
-    Assertions.assertThat(frame.refCnt()).isZero();
 
     Assertions.assertThat(payload.refCnt()).isZero();
     Assertions.assertThat(activeStreams).isEmpty();
 
     Assertions.assertThat(sender.isEmpty()).isTrue();
+
+    // state machine check
+    Assertions.assertThat(requestStreamFlux.requested)
+        .isEqualTo(RequestStreamFlux.STATE_TERMINATED);
   }
 
-
   @Test
-  public void requestNFrameShouldBeSentExectlyOnceIfItIsMaxAllowed() {
+  public void requestNFrameShouldBeSentExactlyOnceIfItIsMaxAllowed() {
     final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
     final Payload payload = ByteBufPayload.create("testData", "testMetadata");
     final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
 
     final RequestStreamFlux requestStreamFlux =
-            new RequestStreamFlux(
-                    ByteBufAllocator.DEFAULT,
-                    payload,
-                    0,
-                    TestStateAware.empty(),
-                    StreamIdSupplier.clientSupplier(),
-                    activeStreams,
-                    sender,
-                    PayloadDecoder.ZERO_COPY);
+        new RequestStreamFlux(
+            ByteBufAllocator.DEFAULT,
+            payload,
+            0,
+            TestStateAware.empty(),
+            StreamIdSupplier.clientSupplier(),
+            activeStreams,
+            sender,
+            PayloadDecoder.ZERO_COPY);
 
     Assertions.assertThat(activeStreams).isEmpty();
 
     final AssertSubscriber<Payload> assertSubscriber =
-            requestStreamFlux.subscribeWith(AssertSubscriber.create(0));
+        requestStreamFlux.subscribeWith(AssertSubscriber.create(0));
     Assertions.assertThat(payload.refCnt()).isOne();
     Assertions.assertThat(activeStreams).isEmpty();
 
-    assertSubscriber.request(1);
+    assertSubscriber.request(Long.MAX_VALUE / 2 + 1);
 
     Assertions.assertThat(payload.refCnt()).isZero();
     Assertions.assertThat(activeStreams).containsEntry(1, requestStreamFlux);
 
     final ByteBuf frame = sender.poll();
     FrameAssert.assertThat(frame)
-            .isNotNull()
-            .hasPayloadSize(
-                    "testData".getBytes(CharsetUtil.UTF_8).length
-                            + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
-            .hasMetadata("testMetadata")
-            .hasData("testData")
-            .hasNoFragmentsFollow()
-            .hasRequestN(1)
-            .typeOf(FrameType.REQUEST_STREAM)
-            .hasClientSideStreamId()
-            .hasStreamId(1);
+        .isNotNull()
+        .hasPayloadSize(
+            "testData".getBytes(CharsetUtil.UTF_8).length
+                + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+        .hasMetadata("testMetadata")
+        .hasData("testData")
+        .hasNoFragmentsFollow()
+        .hasRequestN(Integer.MAX_VALUE)
+        .typeOf(FrameType.REQUEST_STREAM)
+        .hasClientSideStreamId()
+        .hasStreamId(1);
 
     Assertions.assertThat(sender.isEmpty()).isTrue();
-
-    assertSubscriber.request(1);
-    final ByteBuf requestNFrame = sender.poll();
-    FrameAssert.assertThat(requestNFrame)
-            .isNotNull()
-            .hasRequestN(1)
-            .typeOf(FrameType.REQUEST_N)
-            .hasClientSideStreamId()
-            .hasStreamId(1);
-
-    Assertions.assertThat(sender.isEmpty()).isTrue();
-
-    requestStreamFlux.onNext(EmptyPayload.INSTANCE);
-
-    requestStreamFlux.onComplete();
-
-    assertSubscriber.assertValues(EmptyPayload.INSTANCE).assertComplete();
 
     Assertions.assertThat(frame.release()).isTrue();
     Assertions.assertThat(frame.refCnt()).isZero();
+
+    assertSubscriber.request(1);
+    Assertions.assertThat(sender.isEmpty()).isTrue();
+
+    requestStreamFlux.onNext(EmptyPayload.INSTANCE);
+    requestStreamFlux.onComplete();
+
+    assertSubscriber.assertValues(EmptyPayload.INSTANCE).assertComplete();
 
     Assertions.assertThat(payload.refCnt()).isZero();
     Assertions.assertThat(activeStreams).isEmpty();
@@ -183,8 +229,8 @@ public class RequestStreamFluxTest {
   }
 
   @ParameterizedTest
-  @MethodSource("frameShouldBeSentOnSubscriptionResponses")
-  public void frameShouldBeSentOnSubscription(
+  @MethodSource("frameShouldBeSentOnFirstRequestResponses")
+  public void frameShouldBeSentOnFirstRequest(
       BiFunction<RequestStreamFlux, StepVerifier.Step<Payload>, StepVerifier> transformer) {
     final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
     final Payload payload = ByteBufPayload.create("testData", "testMetadata");
@@ -229,37 +275,64 @@ public class RequestStreamFluxTest {
         .hasMetadata("testMetadata")
         .hasData("testData")
         .hasNoFragmentsFollow()
-        .typeOf(FrameType.REQUEST_RESPONSE)
+        .hasRequestN(1)
+        .typeOf(FrameType.REQUEST_STREAM)
         .hasClientSideStreamId()
         .hasStreamId(1);
 
     Assertions.assertThat(frame.release()).isTrue();
     Assertions.assertThat(frame.refCnt()).isZero();
+
+    final ByteBuf requestNFrame = sender.poll();
+    FrameAssert.assertThat(requestNFrame)
+        .isNotNull()
+        .typeOf(FrameType.REQUEST_N)
+        .hasRequestN(Integer.MAX_VALUE)
+        .hasClientSideStreamId()
+        .hasStreamId(1);
+    Assertions.assertThat(requestNFrame.release()).isTrue();
+    Assertions.assertThat(requestNFrame.refCnt()).isZero();
+
     if (!sender.isEmpty()) {
-      FrameAssert.assertThat(sender.poll())
+      final ByteBuf cancelFrame = sender.poll();
+      FrameAssert.assertThat(cancelFrame)
           .isNotNull()
           .typeOf(FrameType.CANCEL)
           .hasClientSideStreamId()
           .hasStreamId(1);
+      Assertions.assertThat(cancelFrame.release()).isTrue();
+      Assertions.assertThat(cancelFrame.refCnt()).isZero();
     }
     Assertions.assertThat(sender.isEmpty()).isTrue();
   }
 
   static Stream<BiFunction<RequestStreamFlux, StepVerifier.Step<Payload>, StepVerifier>>
-      frameShouldBeSentOnSubscriptionResponses() {
+      frameShouldBeSentOnFirstRequestResponses() {
     return Stream.of(
         (rsf, sv) ->
             sv.then(() -> rsf.onNext(EmptyPayload.INSTANCE))
                 .expectNext(EmptyPayload.INSTANCE)
+                .thenRequest(Long.MAX_VALUE)
                 .then(() -> rsf.onNext(EmptyPayload.INSTANCE))
+                .thenRequest(1L)
                 .expectNext(EmptyPayload.INSTANCE)
+                .thenRequest(1L)
                 .then(rsf::onComplete)
                 .expectComplete(),
-        (rsf, sv) -> sv.then(rsf::onComplete).expectComplete(),
         (rsf, sv) ->
             sv.then(() -> rsf.onNext(EmptyPayload.INSTANCE))
                 .expectNext(EmptyPayload.INSTANCE)
+                .thenRequest(Long.MAX_VALUE)
+                .then(rsf::onComplete)
+                .thenRequest(1L)
+                .expectComplete(),
+        (rsf, sv) ->
+            sv.then(() -> rsf.onNext(EmptyPayload.INSTANCE))
+                .expectNext(EmptyPayload.INSTANCE)
+                .thenRequest(Long.MAX_VALUE)
                 .then(() -> rsf.onError(new ApplicationErrorException("test")))
+                .thenRequest(1L)
+                .thenRequest(1L)
                 .expectErrorSatisfies(
                     t ->
                         Assertions.assertThat(t)
@@ -280,7 +353,7 @@ public class RequestStreamFluxTest {
                         FragmentationUtils.encodeFirstFragment(
                             ByteBufAllocator.DEFAULT,
                             64,
-                            FrameType.REQUEST_RESPONSE,
+                            FrameType.NEXT,
                             1,
                             payload.metadata(),
                             payload.data());
@@ -335,7 +408,9 @@ public class RequestStreamFluxTest {
                     Assertions.assertThat(p.refCnt()).isZero();
                   })
               .then(payload::release)
+              .thenRequest(Long.MAX_VALUE)
               .then(() -> rsf.onNext(payload2))
+              .thenRequest(1)
               .assertNext(
                   p -> {
                     Assertions.assertThat(p.data()).isEqualTo(Unpooled.wrappedBuffer(data));
@@ -344,6 +419,7 @@ public class RequestStreamFluxTest {
                     Assertions.assertThat(p.release()).isTrue();
                     Assertions.assertThat(p.refCnt()).isZero();
                   })
+              .thenRequest(1)
               .then(rsf::onComplete)
               .expectComplete();
         },
@@ -361,7 +437,7 @@ public class RequestStreamFluxTest {
                 FragmentationUtils.encodeFirstFragment(
                     ByteBufAllocator.DEFAULT,
                     64,
-                    FrameType.REQUEST_RESPONSE,
+                    FrameType.NEXT,
                     1,
                     payload.metadata(),
                     payload.data()),
@@ -382,6 +458,7 @@ public class RequestStreamFluxTest {
                         Assertions.assertThat(p.release()).isTrue();
                         Assertions.assertThat(p.refCnt()).isZero();
                       })
+                  .thenRequest(Long.MAX_VALUE)
                   .then(
                       () -> {
                         rsf.reassemble(fragments[0], true, false);
@@ -397,6 +474,8 @@ public class RequestStreamFluxTest {
                         rsf.reassemble(fragments[2], true, false);
                         fragments[2].release();
                       })
+                  .thenRequest(1)
+                  .thenRequest(1)
                   .then(payload::release)
                   .thenCancel()
                   .verifyLater();
@@ -410,8 +489,8 @@ public class RequestStreamFluxTest {
   }
 
   @ParameterizedTest
-  @MethodSource("frameShouldBeSentOnSubscriptionResponses")
-  public void frameFragmentsShouldBeSentOnSubscription(
+  @MethodSource("frameShouldBeSentOnFirstRequestResponses")
+  public void frameFragmentsShouldBeSentOnFirstRequest(
       BiFunction<RequestStreamFlux, StepVerifier.Step<Payload>, StepVerifier> transformer) {
     final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
 
@@ -457,11 +536,13 @@ public class RequestStreamFluxTest {
     final ByteBuf frameFragment1 = sender.poll();
     FrameAssert.assertThat(frameFragment1)
         .isNotNull()
-        .hasPayloadSize(55) // 64 - 3 (frame headers) - 3 (encoded metadata length) - 3 frame length
-        .hasMetadata(Arrays.copyOf(metadata, 55))
+        .hasPayloadSize(
+            51) // 64 - 3 (frame headers) - 3 (encoded metadata length) - 3 frame length - 4
+        // InitialRequestN size
+        .hasMetadata(Arrays.copyOf(metadata, 51))
         .hasData(Unpooled.EMPTY_BUFFER)
         .hasFragmentsFollow()
-        .typeOf(FrameType.REQUEST_RESPONSE)
+        .typeOf(FrameType.REQUEST_STREAM)
         .hasClientSideStreamId()
         .hasStreamId(1);
 
@@ -472,8 +553,8 @@ public class RequestStreamFluxTest {
     FrameAssert.assertThat(frameFragment2)
         .isNotNull()
         .hasPayloadSize(55) // 64 - 3 (frame headers) - 3 (encoded metadata length) - 3 frame length
-        .hasMetadata(Arrays.copyOfRange(metadata, 55, 65))
-        .hasData(Arrays.copyOf(data, 45))
+        .hasMetadata(Arrays.copyOfRange(metadata, 51, 65))
+        .hasData(Arrays.copyOf(data, 41))
         .hasFragmentsFollow()
         .typeOf(FrameType.NEXT)
         .hasClientSideStreamId()
@@ -487,7 +568,7 @@ public class RequestStreamFluxTest {
         .isNotNull()
         .hasPayloadSize(58) // 64 - 3 (frame headers) - 3 frame length (no metadata - no length)
         .hasNoMetadata()
-        .hasData(Arrays.copyOfRange(data, 45, 103))
+        .hasData(Arrays.copyOfRange(data, 41, 99))
         .hasFragmentsFollow()
         .typeOf(FrameType.NEXT)
         .hasClientSideStreamId()
@@ -499,9 +580,9 @@ public class RequestStreamFluxTest {
     final ByteBuf frameFragment4 = sender.poll();
     FrameAssert.assertThat(frameFragment4)
         .isNotNull()
-        .hasPayloadSize(26)
+        .hasPayloadSize(30)
         .hasNoMetadata()
-        .hasData(Arrays.copyOfRange(data, 103, 129))
+        .hasData(Arrays.copyOfRange(data, 99, 129))
         .hasNoFragmentsFollow()
         .typeOf(FrameType.NEXT)
         .hasClientSideStreamId()
@@ -509,6 +590,17 @@ public class RequestStreamFluxTest {
 
     Assertions.assertThat(frameFragment4.release()).isTrue();
     Assertions.assertThat(frameFragment4.refCnt()).isZero();
+
+    final ByteBuf requestNFrame = sender.poll();
+    FrameAssert.assertThat(requestNFrame)
+        .isNotNull()
+        .typeOf(FrameType.REQUEST_N)
+        .hasRequestN(Integer.MAX_VALUE)
+        .hasClientSideStreamId()
+        .hasStreamId(1);
+    Assertions.assertThat(requestNFrame.release()).isTrue();
+    Assertions.assertThat(requestNFrame.refCnt()).isZero();
+
     if (!sender.isEmpty()) {
       FrameAssert.assertThat(sender.poll())
           .isNotNull()
@@ -556,6 +648,71 @@ public class RequestStreamFluxTest {
         requestStreamFlux ->
             Assertions.assertThatThrownBy(requestStreamFlux::blockLast)
                 .isInstanceOf(IllegalReferenceCountException.class));
+  }
+
+  @Test
+  public void shouldErrorOnIncorrectRefCntInGivenPayloadLatePhase() {
+    final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+    final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+    final Payload payload = ByteBufPayload.create("");
+
+    final RequestStreamFlux requestStreamFlux =
+        new RequestStreamFlux(
+            ByteBufAllocator.DEFAULT,
+            payload,
+            0,
+            TestStateAware.empty(),
+            StreamIdSupplier.clientSupplier(),
+            activeStreams,
+            sender,
+            PayloadDecoder.ZERO_COPY);
+
+    Assertions.assertThat(activeStreams).isEmpty();
+
+    StepVerifier.create(requestStreamFlux, 0)
+        .expectSubscription()
+        .then(payload::release)
+        .thenRequest(1)
+        .expectError(IllegalReferenceCountException.class)
+        .verify();
+
+    Assertions.assertThat(activeStreams).isEmpty();
+    Assertions.assertThat(sender).isEmpty();
+  }
+
+  @Test
+  public void shouldErrorOnIncorrectRefCntInGivenPayloadLatePhaseWithFragmentation() {
+    final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+    final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+    final byte[] metadata = new byte[65];
+    final byte[] data = new byte[129];
+    ThreadLocalRandom.current().nextBytes(metadata);
+    ThreadLocalRandom.current().nextBytes(data);
+
+    final Payload payload = ByteBufPayload.create(data, metadata);
+
+    final RequestStreamFlux requestStreamFlux =
+        new RequestStreamFlux(
+            ByteBufAllocator.DEFAULT,
+            payload,
+            64,
+            TestStateAware.empty(),
+            StreamIdSupplier.clientSupplier(),
+            activeStreams,
+            sender,
+            PayloadDecoder.ZERO_COPY);
+
+    Assertions.assertThat(activeStreams).isEmpty();
+
+    StepVerifier.create(requestStreamFlux, 0)
+        .expectSubscription()
+        .then(payload::release)
+        .thenRequest(1)
+        .expectError(IllegalReferenceCountException.class)
+        .verify();
+
+    Assertions.assertThat(activeStreams).isEmpty();
+    Assertions.assertThat(sender).isEmpty();
   }
 
   @ParameterizedTest
@@ -709,7 +866,7 @@ public class RequestStreamFluxTest {
           .hasMetadata("testMetadata")
           .hasData("testData")
           .hasNoFragmentsFollow()
-          .typeOf(FrameType.REQUEST_RESPONSE)
+          .typeOf(FrameType.REQUEST_STREAM)
           .hasClientSideStreamId()
           .hasStreamId(1);
 
@@ -781,7 +938,7 @@ public class RequestStreamFluxTest {
           .hasMetadata("testMetadata")
           .hasData("testData")
           .hasNoFragmentsFollow()
-          .typeOf(FrameType.REQUEST_RESPONSE)
+          .typeOf(FrameType.REQUEST_STREAM)
           .hasClientSideStreamId()
           .hasStreamId(1);
 
@@ -845,7 +1002,7 @@ public class RequestStreamFluxTest {
           .hasMetadata("testMetadata")
           .hasData("testData")
           .hasNoFragmentsFollow()
-          .typeOf(FrameType.REQUEST_RESPONSE)
+          .typeOf(FrameType.REQUEST_STREAM)
           .hasClientSideStreamId()
           .hasStreamId(1);
 
@@ -871,16 +1028,18 @@ public class RequestStreamFluxTest {
     }
   }
 
-  @Test
-  public void shouldSentRequestResponseFrameOnceInCaseOfRequestRacing() {
+  @ParameterizedTest
+  @MethodSource("racingCases")
+  public void shouldSentRequestStreamFrameOnceInCaseOfRequestRacing(
+      Function<RequestStreamFlux, Runnable> cases, long realRequestN, int expectedN) {
     for (int i = 0; i < 1000; i++) {
 
       final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
       final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
       final Payload payload = ByteBufPayload.create("testData", "testMetadata");
 
-      final RequestResponseMono requestResponseMono =
-          new RequestResponseMono(
+      final RequestStreamFlux requestStreamFlux =
+          new RequestStreamFlux(
               ByteBufAllocator.DEFAULT,
               payload,
               0,
@@ -893,9 +1052,9 @@ public class RequestStreamFluxTest {
       Payload response = ByteBufPayload.create("test", "test");
 
       final AssertSubscriber<Payload> assertSubscriber =
-          requestResponseMono.doOnNext(Payload::release).subscribeWith(AssertSubscriber.create(0));
+          requestStreamFlux.doOnNext(Payload::release).subscribeWith(AssertSubscriber.create(0));
 
-      RaceTestUtils.race(() -> assertSubscriber.request(1), () -> assertSubscriber.request(1));
+      RaceTestUtils.race(cases.apply(requestStreamFlux), cases.apply(requestStreamFlux));
 
       final ByteBuf sentFrame = sender.poll();
       FrameAssert.assertThat(sentFrame)
@@ -906,23 +1065,642 @@ public class RequestStreamFluxTest {
           .hasMetadata("testMetadata")
           .hasData("testData")
           .hasNoFragmentsFollow()
-          .typeOf(FrameType.REQUEST_RESPONSE)
+          .typeOf(FrameType.REQUEST_STREAM)
           .hasClientSideStreamId()
+          .hasRequestN(expectedN)
           .hasStreamId(1);
-
-      requestResponseMono.onNext(response);
-
-      assertSubscriber.isTerminated();
 
       Assertions.assertThat(sentFrame.release()).isTrue();
       Assertions.assertThat(sentFrame.refCnt()).isZero();
 
       Assertions.assertThat(payload.refCnt()).isZero();
+
+      if (realRequestN < MASK_REQUESTED) {
+        final ByteBuf requestNFrame = sender.poll();
+        FrameAssert.assertThat(requestNFrame)
+            .isNotNull()
+            .typeOf(FrameType.REQUEST_N)
+            .hasRequestN(expectedN)
+            .hasClientSideStreamId()
+            .hasStreamId(1);
+
+        Assertions.assertThat(requestNFrame.release()).isTrue();
+        Assertions.assertThat(requestNFrame.refCnt()).isZero();
+
+        Assertions.assertThat(requestStreamFlux.requested).isZero();
+      } else {
+        Assertions.assertThat(requestStreamFlux.requested).isEqualTo(MASK_REQUESTED_MAX);
+      }
+
+      requestStreamFlux.onNext(response);
       Assertions.assertThat(response.refCnt()).isZero();
+
+      requestStreamFlux.onComplete();
+      assertSubscriber.assertTerminated();
 
       Assertions.assertThat(activeStreams).isEmpty();
       Assertions.assertThat(sender.isEmpty()).isTrue();
     }
+  }
+
+  @ParameterizedTest
+  @MethodSource("racingCases")
+  public void shouldBeConsistentInCaseOfRequestRacing(
+      Function<RequestStreamFlux, Runnable> cases, long realRequestN, int expectedN) {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestStreamFlux requestStreamFlux =
+          new RequestStreamFlux(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestStreamFlux.doOnNext(Payload::release).subscribeWith(AssertSubscriber.create(0));
+
+      assertSubscriber.request(1);
+
+      final ByteBuf sentFrame = sender.poll();
+      FrameAssert.assertThat(sentFrame)
+          .isNotNull()
+          .hasPayloadSize(
+              "testData".getBytes(CharsetUtil.UTF_8).length
+                  + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+          .hasMetadata("testMetadata")
+          .hasData("testData")
+          .hasNoFragmentsFollow()
+          .typeOf(FrameType.REQUEST_STREAM)
+          .hasClientSideStreamId()
+          .hasStreamId(1);
+
+      Assertions.assertThat(sentFrame.release()).isTrue();
+      Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+
+      RaceTestUtils.race(cases.apply(requestStreamFlux), cases.apply(requestStreamFlux));
+
+      final ByteBuf requestNFrame1 = sender.poll();
+      FrameAssert.assertThat(requestNFrame1)
+          .isNotNull()
+          .typeOf(FrameType.REQUEST_N)
+          .hasRequestN(expectedN)
+          .hasClientSideStreamId()
+          .hasStreamId(1);
+
+      Assertions.assertThat(requestNFrame1.release()).isTrue();
+      Assertions.assertThat(requestNFrame1.refCnt()).isZero();
+
+      if (realRequestN < RequestStreamFlux.MASK_REQUESTED) {
+        final ByteBuf requestNFrame2 = sender.poll();
+        FrameAssert.assertThat(requestNFrame2)
+            .isNotNull()
+            .typeOf(FrameType.REQUEST_N)
+            .hasRequestN(expectedN)
+            .hasClientSideStreamId()
+            .hasStreamId(1);
+
+        Assertions.assertThat(requestNFrame2.release()).isTrue();
+        Assertions.assertThat(requestNFrame2.refCnt()).isZero();
+
+        Assertions.assertThat(requestStreamFlux.requested).isZero();
+      } else {
+        Assertions.assertThat(requestStreamFlux.requested).isEqualTo(MASK_REQUESTED_MAX);
+      }
+
+      Assertions.assertThat(requestStreamFlux.requested)
+          .matches(s -> (s & FLAG_REASSEMBLY) != FLAG_REASSEMBLY);
+
+      requestStreamFlux.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      requestStreamFlux.onComplete();
+      assertSubscriber.assertTerminated();
+
+      Assertions.assertThat(activeStreams).isEmpty();
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource("racingCases")
+  public void shouldBeConsistentInCaseOfRequestRacingDuringReassembly(
+      Function<RequestStreamFlux, Runnable> cases, long realRequestN, int expectedN) {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestStreamFlux requestStreamFlux =
+          new RequestStreamFlux(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestStreamFlux.doOnNext(Payload::release).subscribeWith(AssertSubscriber.create(0));
+
+      assertSubscriber.request(1);
+
+      final ByteBuf sentFrame = sender.poll();
+      FrameAssert.assertThat(sentFrame)
+          .isNotNull()
+          .hasPayloadSize(
+              "testData".getBytes(CharsetUtil.UTF_8).length
+                  + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+          .hasMetadata("testMetadata")
+          .hasData("testData")
+          .hasNoFragmentsFollow()
+          .typeOf(FrameType.REQUEST_STREAM)
+          .hasClientSideStreamId()
+          .hasStreamId(1);
+
+      Assertions.assertThat(sentFrame.release()).isTrue();
+      Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+
+      requestStreamFlux.reassemble(Unpooled.EMPTY_BUFFER, true, false);
+
+      RaceTestUtils.race(cases.apply(requestStreamFlux), cases.apply(requestStreamFlux));
+
+      final ByteBuf requestNFrame1 = sender.poll();
+      FrameAssert.assertThat(requestNFrame1)
+          .isNotNull()
+          .typeOf(FrameType.REQUEST_N)
+          .hasRequestN(expectedN)
+          .hasClientSideStreamId()
+          .hasStreamId(1);
+
+      Assertions.assertThat(requestNFrame1.release()).isTrue();
+      Assertions.assertThat(requestNFrame1.refCnt()).isZero();
+
+      if (realRequestN < RequestStreamFlux.MASK_REQUESTED) {
+        final ByteBuf requestNFrame2 = sender.poll();
+        FrameAssert.assertThat(requestNFrame2)
+            .isNotNull()
+            .typeOf(FrameType.REQUEST_N)
+            .hasRequestN(expectedN)
+            .hasClientSideStreamId()
+            .hasStreamId(1);
+
+        Assertions.assertThat(requestNFrame2.release()).isTrue();
+        Assertions.assertThat(requestNFrame2.refCnt()).isZero();
+      } else {
+        Assertions.assertThat(requestStreamFlux.requested)
+            .matches(s -> (s & MASK_REQUESTED_MAX) == MASK_REQUESTED_MAX);
+      }
+
+      Assertions.assertThat(requestStreamFlux.requested)
+          .matches(s -> (s & FLAG_REASSEMBLY) == FLAG_REASSEMBLY);
+
+      requestStreamFlux.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      requestStreamFlux.onComplete();
+      assertSubscriber.assertTerminated();
+
+      Assertions.assertThat(activeStreams).isEmpty();
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource("racingCases")
+  public void shouldBeConsistentInCaseOfRacingOfReassemblyAndRequest(
+      Function<RequestStreamFlux, Runnable> cases, long realRequestN, int expectedN) {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestStreamFlux requestStreamFlux =
+          new RequestStreamFlux(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestStreamFlux.doOnNext(Payload::release).subscribeWith(AssertSubscriber.create(0));
+
+      assertSubscriber.request(1);
+
+      final ByteBuf sentFrame = sender.poll();
+      FrameAssert.assertThat(sentFrame)
+          .isNotNull()
+          .hasPayloadSize(
+              "testData".getBytes(CharsetUtil.UTF_8).length
+                  + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+          .hasMetadata("testMetadata")
+          .hasData("testData")
+          .hasNoFragmentsFollow()
+          .typeOf(FrameType.REQUEST_STREAM)
+          .hasClientSideStreamId()
+          .hasStreamId(1);
+
+      Assertions.assertThat(sentFrame.release()).isTrue();
+      Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+
+      RaceTestUtils.race(
+          () -> requestStreamFlux.reassemble(Unpooled.EMPTY_BUFFER, true, false),
+          cases.apply(requestStreamFlux));
+
+      final ByteBuf requestNFrame1 = sender.poll();
+      FrameAssert.assertThat(requestNFrame1)
+          .isNotNull()
+          .typeOf(FrameType.REQUEST_N)
+          .hasRequestN(expectedN)
+          .hasClientSideStreamId()
+          .hasStreamId(1);
+
+      Assertions.assertThat(requestNFrame1.release()).isTrue();
+      Assertions.assertThat(requestNFrame1.refCnt()).isZero();
+
+      Assertions.assertThat(requestStreamFlux.requested)
+          .matches(s -> (s & FLAG_REASSEMBLY) == FLAG_REASSEMBLY);
+
+      requestStreamFlux.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      requestStreamFlux.onComplete();
+      assertSubscriber.assertTerminated();
+
+      Assertions.assertThat(activeStreams).isEmpty();
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource("racingCases")
+  public void shouldBeConsistentInCaseOfRacingOfCancellationAndRequest(
+      Function<RequestStreamFlux, Runnable> cases, long realRequestN, int expectedN) {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestStreamFlux requestStreamFlux =
+          new RequestStreamFlux(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestStreamFlux.subscribeWith(new AssertSubscriber<>(0));
+
+      RaceTestUtils.race(requestStreamFlux::cancel, cases.apply(requestStreamFlux));
+
+      if (!sender.isEmpty()) {
+        final ByteBuf sentFrame = sender.poll();
+        FrameAssert.assertThat(sentFrame)
+            .isNotNull()
+            .hasNoFragmentsFollow()
+            .hasRequestN(expectedN)
+            .typeOf(FrameType.REQUEST_STREAM)
+            .hasClientSideStreamId()
+            .hasPayloadSize(
+                "testData".getBytes(CharsetUtil.UTF_8).length
+                    + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+            .hasMetadata("testMetadata")
+            .hasData("testData")
+            .hasStreamId(1);
+
+        Assertions.assertThat(sentFrame.release()).isTrue();
+        Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+        final ByteBuf cancelFrame = sender.poll();
+        FrameAssert.assertThat(cancelFrame)
+            .isNotNull()
+            .typeOf(FrameType.CANCEL)
+            .hasClientSideStreamId()
+            .hasStreamId(1);
+
+        Assertions.assertThat(cancelFrame.release()).isTrue();
+        Assertions.assertThat(cancelFrame.refCnt()).isZero();
+      }
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+      Assertions.assertThat(activeStreams).isEmpty();
+
+      Assertions.assertThat(requestStreamFlux.requested)
+          .isEqualTo(RequestStreamFlux.STATE_TERMINATED);
+
+      requestStreamFlux.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      requestStreamFlux.onComplete();
+      assertSubscriber.assertNotTerminated();
+
+      Assertions.assertThat(activeStreams).isEmpty();
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource("racingCases")
+  public void shouldBeConsistentInCaseOfRacingOfOnCompleteAndRequest(
+      Function<RequestStreamFlux, Runnable> cases, long realRequestN, int expectedN) {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestStreamFlux requestStreamFlux =
+          new RequestStreamFlux(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestStreamFlux.subscribeWith(new AssertSubscriber<>(0));
+
+      assertSubscriber.request(1);
+
+      final ByteBuf sentFrame = sender.poll();
+      FrameAssert.assertThat(sentFrame)
+          .isNotNull()
+          .hasNoFragmentsFollow()
+          .hasRequestN(1)
+          .typeOf(FrameType.REQUEST_STREAM)
+          .hasClientSideStreamId()
+          .hasPayloadSize(
+              "testData".getBytes(CharsetUtil.UTF_8).length
+                  + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+          .hasMetadata("testMetadata")
+          .hasData("testData")
+          .hasStreamId(1);
+
+      Assertions.assertThat(sentFrame.release()).isTrue();
+      Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+      RaceTestUtils.race(requestStreamFlux::onComplete, cases.apply(requestStreamFlux));
+
+      if (!sender.isEmpty()) {
+        final ByteBuf requestNFrame = sender.poll();
+        FrameAssert.assertThat(requestNFrame)
+            .isNotNull()
+            .typeOf(FrameType.REQUEST_N)
+            .hasRequestN(expectedN)
+            .hasClientSideStreamId()
+            .hasStreamId(1);
+
+        Assertions.assertThat(requestNFrame.release()).isTrue();
+        Assertions.assertThat(requestNFrame.refCnt()).isZero();
+      }
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+      Assertions.assertThat(activeStreams).isEmpty();
+
+      Assertions.assertThat(requestStreamFlux.requested)
+          .isEqualTo(RequestStreamFlux.STATE_TERMINATED);
+
+      requestStreamFlux.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      requestStreamFlux.onComplete();
+      assertSubscriber.assertTerminated();
+
+      Assertions.assertThat(activeStreams).isEmpty();
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+    }
+  }
+
+  @ParameterizedTest
+  @MethodSource("racingCases")
+  public void shouldBeConsistentInCaseOfRacingOfOnErrorAndRequest(
+      Function<RequestStreamFlux, Runnable> cases, long realRequestN, int expectedN) {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestStreamFlux requestStreamFlux =
+          new RequestStreamFlux(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestStreamFlux.subscribeWith(new AssertSubscriber<>(0));
+
+      assertSubscriber.request(1);
+
+      final ByteBuf sentFrame = sender.poll();
+      FrameAssert.assertThat(sentFrame)
+          .isNotNull()
+          .hasNoFragmentsFollow()
+          .hasRequestN(1)
+          .typeOf(FrameType.REQUEST_STREAM)
+          .hasClientSideStreamId()
+          .hasPayloadSize(
+              "testData".getBytes(CharsetUtil.UTF_8).length
+                  + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+          .hasMetadata("testMetadata")
+          .hasData("testData")
+          .hasStreamId(1);
+
+      Assertions.assertThat(sentFrame.release()).isTrue();
+      Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+      RuntimeException exception = new RuntimeException("test");
+      RaceTestUtils.race(
+          () -> requestStreamFlux.onError(exception), cases.apply(requestStreamFlux));
+
+      if (!sender.isEmpty()) {
+        final ByteBuf requestNFrame = sender.poll();
+        FrameAssert.assertThat(requestNFrame)
+            .isNotNull()
+            .typeOf(FrameType.REQUEST_N)
+            .hasRequestN(expectedN)
+            .hasClientSideStreamId()
+            .hasStreamId(1);
+
+        Assertions.assertThat(requestNFrame.release()).isTrue();
+        Assertions.assertThat(requestNFrame.refCnt()).isZero();
+      }
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+      Assertions.assertThat(activeStreams).isEmpty();
+
+      Assertions.assertThat(requestStreamFlux.requested)
+          .isEqualTo(RequestStreamFlux.STATE_TERMINATED);
+
+      requestStreamFlux.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      requestStreamFlux.onComplete();
+      assertSubscriber
+          .assertTerminated()
+          .assertError(RuntimeException.class)
+          .assertErrorMessage("test");
+
+      Assertions.assertThat(activeStreams).isEmpty();
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+    }
+  }
+
+  @Test
+  public void shouldSentCancelFrameExactlyOnce() {
+    for (int i = 0; i < 1000; i++) {
+
+      final UnboundedProcessor<ByteBuf> sender = new UnboundedProcessor<>();
+      final IntObjectMap<Reassemble<?>> activeStreams = new SynchronizedIntObjectHashMap<>();
+      final Payload payload = ByteBufPayload.create("testData", "testMetadata");
+
+      final RequestStreamFlux requestStreamFlux =
+          new RequestStreamFlux(
+              ByteBufAllocator.DEFAULT,
+              payload,
+              0,
+              TestStateAware.empty(),
+              StreamIdSupplier.clientSupplier(),
+              activeStreams,
+              sender,
+              PayloadDecoder.ZERO_COPY);
+
+      Payload response = ByteBufPayload.create("test", "test");
+
+      final AssertSubscriber<Payload> assertSubscriber =
+          requestStreamFlux.subscribeWith(new AssertSubscriber<>(0));
+
+      assertSubscriber.request(1);
+
+      final ByteBuf sentFrame = sender.poll();
+      FrameAssert.assertThat(sentFrame)
+          .isNotNull()
+          .hasNoFragmentsFollow()
+          .hasRequestN(1)
+          .typeOf(FrameType.REQUEST_STREAM)
+          .hasClientSideStreamId()
+          .hasPayloadSize(
+              "testData".getBytes(CharsetUtil.UTF_8).length
+                  + "testMetadata".getBytes(CharsetUtil.UTF_8).length)
+          .hasMetadata("testMetadata")
+          .hasData("testData")
+          .hasStreamId(1);
+
+      Assertions.assertThat(sentFrame.release()).isTrue();
+      Assertions.assertThat(sentFrame.refCnt()).isZero();
+
+      RaceTestUtils.race(requestStreamFlux::cancel, requestStreamFlux::cancel);
+
+      final ByteBuf cancelFrame = sender.poll();
+      FrameAssert.assertThat(cancelFrame)
+          .isNotNull()
+          .typeOf(FrameType.CANCEL)
+          .hasClientSideStreamId()
+          .hasStreamId(1);
+
+      Assertions.assertThat(cancelFrame.release()).isTrue();
+      Assertions.assertThat(cancelFrame.refCnt()).isZero();
+
+      Assertions.assertThat(payload.refCnt()).isZero();
+      Assertions.assertThat(activeStreams).isEmpty();
+
+      Assertions.assertThat(requestStreamFlux.requested)
+          .isEqualTo(RequestStreamFlux.STATE_TERMINATED);
+
+      requestStreamFlux.onNext(response);
+      Assertions.assertThat(response.refCnt()).isZero();
+
+      requestStreamFlux.onComplete();
+      assertSubscriber.assertNotTerminated();
+
+      Assertions.assertThat(activeStreams).isEmpty();
+      Assertions.assertThat(sender.isEmpty()).isTrue();
+    }
+  }
+
+  public static Stream<Arguments> racingCases() {
+    return Stream.of(
+        Arguments.of(
+            (Function<RequestStreamFlux, Runnable>)
+                requestStreamFlux -> () -> requestStreamFlux.request(1),
+            1L,
+            1),
+        Arguments.of(
+            (Function<RequestStreamFlux, Runnable>)
+                requestStreamFlux -> () -> requestStreamFlux.request(Long.MAX_VALUE),
+            Long.MAX_VALUE,
+            Integer.MAX_VALUE),
+        Arguments.of(
+            (Function<RequestStreamFlux, Runnable>)
+                requestStreamFlux -> () -> requestStreamFlux.request(Long.MAX_VALUE / 2 + 1),
+            Long.MAX_VALUE / 2 + 1,
+            Integer.MAX_VALUE),
+        Arguments.of(
+            (Function<RequestStreamFlux, Runnable>)
+                requestStreamFlux -> () -> requestStreamFlux.request(Long.MAX_VALUE / 2),
+            Long.MAX_VALUE / 2,
+            Integer.MAX_VALUE),
+        Arguments.of(
+            (Function<RequestStreamFlux, Runnable>)
+                requestStreamFlux -> () -> requestStreamFlux.request(Long.MAX_VALUE / 4 + 1),
+            Long.MAX_VALUE / 4 + 1,
+            Integer.MAX_VALUE),
+        Arguments.of(
+            (Function<RequestStreamFlux, Runnable>)
+                requestStreamFlux -> () -> requestStreamFlux.request(Long.MAX_VALUE / 4),
+            Long.MAX_VALUE / 4,
+            Integer.MAX_VALUE),
+        Arguments.of(
+            (Function<RequestStreamFlux, Runnable>)
+                requestStreamFlux -> () -> requestStreamFlux.request(Integer.MAX_VALUE / 2),
+            Integer.MAX_VALUE / 2,
+            Integer.MAX_VALUE / 2));
   }
 
   @Test
