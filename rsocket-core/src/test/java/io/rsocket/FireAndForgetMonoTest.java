@@ -33,6 +33,12 @@ public class FireAndForgetMonoTest {
     StepVerifier.setDefaultTimeout(Duration.ofSeconds(2));
   }
 
+
+  /**
+   * General StateMachine transition test.
+   * No Fragmentation enabled
+   * In this test we check that the given instance of FireAndForgetMono subscribes, and then sends frame immediately
+   */
   @ParameterizedTest
   @MethodSource("frameSent")
   public void frameShouldBeSentOnSubscription(Consumer<FireAndForgetMono> monoConsumer) {
@@ -49,6 +55,8 @@ public class FireAndForgetMonoTest {
             StreamIdSupplier.clientSupplier(),
             activeStreams,
             sender);
+
+    Assertions.assertThat(fireAndForgetMono.once).isZero();
 
     Assertions.assertThat(activeStreams).isEmpty();
 
@@ -74,8 +82,14 @@ public class FireAndForgetMonoTest {
     Assertions.assertThat(frame.release()).isTrue();
     Assertions.assertThat(frame.refCnt()).isZero();
     Assertions.assertThat(sender.isEmpty()).isTrue();
+    Assertions.assertThat(fireAndForgetMono.once).isOne();
   }
 
+  /**
+   * General StateMachine transition test.
+   * Fragmentation enabled
+   * In this test we check that the given instance of FireAndForgetMono subscribes, and then sends all fragments as a separate frame immediately
+   */
   @ParameterizedTest
   @MethodSource("frameSent")
   public void frameFragmentsShouldBeSentOnSubscription(Consumer<FireAndForgetMono> monoConsumer) {
@@ -99,6 +113,7 @@ public class FireAndForgetMonoTest {
             activeStreams,
             sender);
 
+    Assertions.assertThat(fireAndForgetMono.once).isZero();
     Assertions.assertThat(activeStreams).isEmpty();
 
     monoConsumer.accept(fireAndForgetMono);
@@ -164,6 +179,7 @@ public class FireAndForgetMonoTest {
     Assertions.assertThat(frameFragment4.release()).isTrue();
     Assertions.assertThat(frameFragment4.refCnt()).isZero();
     Assertions.assertThat(sender.isEmpty()).isTrue();
+    Assertions.assertThat(fireAndForgetMono.once).isOne();
   }
 
   static Stream<Consumer<FireAndForgetMono>> frameSent() {
@@ -172,6 +188,12 @@ public class FireAndForgetMonoTest {
         FireAndForgetMono::block);
   }
 
+
+  /**
+   * RefCnt validation test.
+   * Should send error if RefCnt is incorrect and frame has already been released
+   * Note: ONCE state should be 0
+   */
   @ParameterizedTest
   @MethodSource("shouldErrorOnIncorrectRefCntInGivenPayloadSource")
   public void shouldErrorOnIncorrectRefCntInGivenPayload(Consumer<FireAndForgetMono> monoConsumer) {
@@ -190,10 +212,12 @@ public class FireAndForgetMonoTest {
             activeStreams,
             sender);
 
+    Assertions.assertThat(fireAndForgetMono.once).isZero();
     Assertions.assertThat(activeStreams).isEmpty();
 
     monoConsumer.accept(fireAndForgetMono);
 
+    Assertions.assertThat(fireAndForgetMono.once).isOne();
     Assertions.assertThat(activeStreams).isEmpty();
     Assertions.assertThat(sender.isEmpty()).isTrue();
   }
@@ -210,6 +234,10 @@ public class FireAndForgetMonoTest {
                 .isInstanceOf(IllegalReferenceCountException.class));
   }
 
+  /**
+   * Check that proper payload size validation is enabled so in case payload fragmentation
+   * is disabled we will not send anything bigger that 16MB (see specification for MAX frame size)
+   */
   @ParameterizedTest
   @MethodSource("shouldErrorIfFragmentExitsAllowanceIfFragmentationDisabledSource")
   public void shouldErrorIfFragmentExitsAllowanceIfFragmentationDisabled(
@@ -234,12 +262,14 @@ public class FireAndForgetMonoTest {
             activeStreams,
             sender);
 
+    Assertions.assertThat(fireAndForgetMono.once).isZero();
     Assertions.assertThat(activeStreams).isEmpty();
 
     monoConsumer.accept(fireAndForgetMono);
 
     Assertions.assertThat(payload.refCnt()).isZero();
 
+    Assertions.assertThat(fireAndForgetMono.once).isOne();
     Assertions.assertThat(activeStreams).isEmpty();
     Assertions.assertThat(sender.isEmpty()).isTrue();
   }
@@ -262,6 +292,12 @@ public class FireAndForgetMonoTest {
                 .isInstanceOf(IllegalArgumentException.class));
   }
 
+  /**
+   * Ensures that frame will not be sent if we dont have availability for that.
+   * Options:
+   * 1. RSocket disposed / Connection Error, so all racing on existing interactions should be terminated as well
+   * 2. RSocket tries to use lease and end-ups with no available leases
+   */
   @ParameterizedTest
   @MethodSource("shouldErrorIfNoAvailabilitySource")
   public void shouldErrorIfNoAvailability(Consumer<FireAndForgetMono> monoConsumer) {
@@ -279,12 +315,14 @@ public class FireAndForgetMonoTest {
             activeStreams,
             sender);
 
+    Assertions.assertThat(fireAndForgetMono.once).isZero();
     Assertions.assertThat(activeStreams).isEmpty();
 
     monoConsumer.accept(fireAndForgetMono);
 
     Assertions.assertThat(payload.refCnt()).isZero();
 
+    Assertions.assertThat(fireAndForgetMono.once).isOne();
     Assertions.assertThat(activeStreams).isEmpty();
     Assertions.assertThat(sender.isEmpty()).isTrue();
   }

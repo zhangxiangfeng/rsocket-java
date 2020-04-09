@@ -162,30 +162,32 @@ final class RequestStreamFlux extends Flux<Payload> implements Reassemble<Payloa
   public void subscribe(CoreSubscriber<? super Payload> actual) {
     final Payload p = this.payload;
 
-    if (p.refCnt() > 0) {
-      if (this.requested == STATE_UNSUBSCRIBED
-          && REQUESTED.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
-        this.actual = actual;
+    if (this.requested == STATE_UNSUBSCRIBED
+        && REQUESTED.compareAndSet(this, STATE_UNSUBSCRIBED, STATE_SUBSCRIBED)) {
 
-        final int mtu = this.mtu;
-        final boolean hasMetadata = p.hasMetadata();
-        final ByteBuf metadata = p.metadata();
-        final ByteBuf data = p.data();
-
-        if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
-          Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
-          p.release();
-          return;
-        }
-
-        // call onSubscribe if has value in the result or no result delivered so far
-        actual.onSubscribe(this);
-      } else {
-        Operators.error(
-            actual, new IllegalStateException("RequestStreamFlux allows only a single Subscriber"));
+      if (p.refCnt() <= 0) {
+        this.requested = STATE_TERMINATED;
+        Operators.error(actual, new IllegalReferenceCountException(0));
       }
+
+      this.actual = actual;
+
+      final int mtu = this.mtu;
+      final boolean hasMetadata = p.hasMetadata();
+      final ByteBuf metadata = p.metadata();
+      final ByteBuf data = p.data();
+
+      if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
+        Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
+        p.release();
+        return;
+      }
+
+      // call onSubscribe if has value in the result or no result delivered so far
+      actual.onSubscribe(this);
     } else {
-      Operators.error(actual, new IllegalReferenceCountException(0));
+      Operators.error(
+          actual, new IllegalStateException("RequestStreamFlux allows only a single Subscriber"));
     }
   }
 

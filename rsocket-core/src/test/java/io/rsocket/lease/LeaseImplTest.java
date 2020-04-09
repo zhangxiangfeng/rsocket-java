@@ -43,6 +43,7 @@ public class LeaseImplTest {
   }
 
   @Test
+  // FIXME: fails from time to time
   public void leaseAvailability() {
     LeaseImpl lease = LeaseImpl.create(2, 100, Unpooled.EMPTY_BUFFER);
     Assertions.assertEquals(1.0, lease.availability(), 1e-5);

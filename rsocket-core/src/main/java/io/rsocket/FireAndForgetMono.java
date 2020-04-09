@@ -60,72 +60,74 @@ final class FireAndForgetMono extends Mono<Void> implements Scannable {
   public void subscribe(CoreSubscriber<? super Void> actual) {
     final Payload p = this.payload;
 
-    if (p.refCnt() > 0) {
-      if (once == 0 && ONCE.compareAndSet(this, 0, 1)) {
-        try {
-          final boolean hasMetadata = p.hasMetadata();
-          final ByteBuf data = p.data();
-          final ByteBuf metadata = p.metadata();
-          final int mtu = this.mtu;
+    if (this.once == 0 && ONCE.compareAndSet(this, 0, 1)) {
+      // check payload is valid from refCnt perspective
+      if (p.refCnt() <= 0) {
+        Operators.error(actual, new IllegalReferenceCountException(0));
+        return;
+      }
 
-          if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
-            Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
+      try {
+        final boolean hasMetadata = p.hasMetadata();
+        final ByteBuf data = p.data();
+        final ByteBuf metadata = p.metadata();
+        final int mtu = this.mtu;
+
+        if (hasMetadata ? !isValid(mtu, data, metadata) : !isValid(mtu, data)) {
+          Operators.error(actual, new IllegalArgumentException("Too Big Payload size"));
+        } else {
+          final Throwable throwable = parent.checkAvailable();
+          if (throwable != null) {
+            Operators.error(actual, throwable);
           } else {
-            final Throwable throwable = parent.checkAvailable();
-            if (throwable != null) {
-              Operators.error(actual, throwable);
-            } else {
-              final int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
-              final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
-              final ByteBufAllocator allocator = this.allocator;
+            final int streamId = this.streamIdSupplier.nextStreamId(this.activeStreams);
+            final UnboundedProcessor<ByteBuf> sender = this.sendProcessor;
+            final ByteBufAllocator allocator = this.allocator;
 
-              if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
-                final ByteBuf slicedData = data.slice();
-                final ByteBuf slicedMetadata =
-                    hasMetadata ? metadata.slice() : Unpooled.EMPTY_BUFFER;
+            if (hasMetadata ? isFragmentable(mtu, data, metadata) : isFragmentable(mtu, data)) {
+              final ByteBuf slicedData = data.slice();
+              final ByteBuf slicedMetadata =
+                  hasMetadata ? metadata.slice() : Unpooled.EMPTY_BUFFER;
 
-                final ByteBuf first =
-                    FragmentationUtils.encodeFirstFragment(
-                        allocator,
-                        mtu,
-                        FrameType.REQUEST_FNF,
-                        streamId,
-                        slicedMetadata,
-                        slicedData);
-                sender.onNext(first);
+              final ByteBuf first =
+                  FragmentationUtils.encodeFirstFragment(
+                      allocator,
+                      mtu,
+                      FrameType.REQUEST_FNF,
+                      streamId,
+                      slicedMetadata,
+                      slicedData);
+              sender.onNext(first);
 
-                while (slicedData.isReadable() || slicedMetadata.isReadable()) {
-                  ByteBuf following =
-                      FragmentationUtils.encodeFollowsFragment(
-                          allocator, mtu, streamId, false, slicedMetadata, slicedData);
-                  sender.onNext(following);
-                }
-              } else {
-                final ByteBuf slicedRetainedData = data.retainedSlice();
-                final ByteBuf slicedRetainedMetadata =
-                    hasMetadata ? metadata.retainedSlice() : null;
-
-                final ByteBuf requestFrame =
-                    RequestFireAndForgetFrameFlyweight.encode(
-                        allocator, streamId, false, slicedRetainedMetadata, slicedRetainedData);
-                sender.onNext(requestFrame);
+              while (slicedData.isReadable() || slicedMetadata.isReadable()) {
+                ByteBuf following =
+                    FragmentationUtils.encodeFollowsFragment(
+                        allocator, mtu, streamId, false, slicedMetadata, slicedData);
+                sender.onNext(following);
               }
+            } else {
+              final ByteBuf slicedRetainedData = data.retainedSlice();
+              final ByteBuf slicedRetainedMetadata =
+                  hasMetadata ? metadata.retainedSlice() : null;
 
-              Operators.complete(actual);
+              final ByteBuf requestFrame =
+                  RequestFireAndForgetFrameFlyweight.encode(
+                      allocator, streamId, false, slicedRetainedMetadata, slicedRetainedData);
+              sender.onNext(requestFrame);
             }
-          }
 
-          p.release();
-        } catch (Throwable e) {
-          ReferenceCountUtil.safeRelease(p);
-          Operators.error(actual, e);
+            Operators.complete(actual);
+          }
         }
-      } else {
-        Operators.error(
-            actual, new IllegalStateException("FireAndForgetMono allows only a single Subscriber"));
+
+        p.release();
+      } catch (Throwable e) {
+        ReferenceCountUtil.safeRelease(p);
+        Operators.error(actual, e);
       }
     } else {
-      Operators.error(actual, new IllegalReferenceCountException(0));
+      Operators.error(
+          actual, new IllegalStateException("FireAndForgetMono allows only a single Subscriber"));
     }
   }
 

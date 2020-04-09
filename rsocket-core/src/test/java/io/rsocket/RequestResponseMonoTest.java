@@ -32,6 +32,12 @@ import reactor.core.Scannable;
 import reactor.test.StepVerifier;
 import reactor.test.util.RaceTestUtils;
 
+import static io.rsocket.RequestResponseMono.FLAG_REASSEMBLING;
+import static io.rsocket.RequestResponseMono.FLAG_SENT;
+import static io.rsocket.RequestResponseMono.STATE_REQUESTED;
+import static io.rsocket.RequestResponseMono.STATE_TERMINATED;
+import static io.rsocket.RequestResponseMono.STATE_UNSUBSCRIBED;
+
 public class RequestResponseMonoTest {
 
   @BeforeAll
@@ -39,6 +45,21 @@ public class RequestResponseMonoTest {
     StepVerifier.setDefaultTimeout(Duration.ofSeconds(2));
   }
 
+  /*
+   * +-------------------------------+
+   * |      General Test Cases       |
+   * +-------------------------------+
+   *
+   */
+
+  /**
+   * General StateMachine transition test.
+   * No Fragmentation enabled
+   * In this test we check that the given instance of RequestResponseMono:
+   *  1) subscribes
+   *  2) sends frame on the first request
+   *  3) terminates up on receiving the first signal (terminates on first next | error | next over reassembly | complete)
+   */
   @ParameterizedTest
   @MethodSource("frameShouldBeSentOnSubscriptionResponses")
   public void frameShouldBeSentOnSubscription(
@@ -58,6 +79,8 @@ public class RequestResponseMonoTest {
             sender,
             PayloadDecoder.ZERO_COPY);
 
+    Assertions.assertThat(requestResponseMono.state)
+            .isEqualTo(RequestResponseMono.STATE_UNSUBSCRIBED);
     Assertions.assertThat(activeStreams).isEmpty();
 
     transformer
@@ -65,9 +88,17 @@ public class RequestResponseMonoTest {
             requestResponseMono,
             StepVerifier.create(requestResponseMono, 0)
                 .expectSubscription()
+                .then(() ->
+                        Assertions.assertThat(requestResponseMono.state)
+                                .isEqualTo(RequestResponseMono.STATE_SUBSCRIBED)
+                )
                 .then(() -> Assertions.assertThat(payload.refCnt()).isOne())
                 .then(() -> Assertions.assertThat(activeStreams).isEmpty())
                 .thenRequest(1)
+                .then(() ->
+                        Assertions.assertThat(requestResponseMono.state)
+                                .isEqualTo(STATE_REQUESTED | FLAG_SENT)
+                )
                 .then(() -> Assertions.assertThat(payload.refCnt()).isZero())
                 .then(
                     () ->
@@ -93,6 +124,8 @@ public class RequestResponseMonoTest {
 
     Assertions.assertThat(frame.release()).isTrue();
     Assertions.assertThat(frame.refCnt()).isZero();
+    Assertions.assertThat(requestResponseMono.state)
+            .isEqualTo(STATE_TERMINATED);
     if (!sender.isEmpty()) {
       FrameAssert.assertThat(sender.poll())
           .isNotNull()
@@ -106,11 +139,14 @@ public class RequestResponseMonoTest {
   static Stream<BiFunction<RequestResponseMono, StepVerifier.Step<Payload>, StepVerifier>>
       frameShouldBeSentOnSubscriptionResponses() {
     return Stream.of(
+        // next case
         (rrm, sv) ->
             sv.then(() -> rrm.onNext(EmptyPayload.INSTANCE))
                 .expectNext(EmptyPayload.INSTANCE)
                 .expectComplete(),
+        // complete case
         (rrm, sv) -> sv.then(rrm::onComplete).expectComplete(),
+        // error case
         (rrm, sv) ->
             sv.then(() -> rrm.onError(new ApplicationErrorException("test")))
                 .expectErrorSatisfies(
@@ -118,6 +154,7 @@ public class RequestResponseMonoTest {
                         Assertions.assertThat(t)
                             .hasMessage("test")
                             .isInstanceOf(ApplicationErrorException.class)),
+        // fragmentation case
         (rrm, sv) -> {
           final byte[] metadata = new byte[65];
           final byte[] data = new byte[129];
@@ -139,6 +176,10 @@ public class RequestResponseMonoTest {
                     rrm.reassemble(followingFrame, true, false);
                     followingFrame.release();
                   })
+              .then(() ->
+                    Assertions.assertThat(rrm.state)
+                            .isEqualTo(STATE_REQUESTED | FLAG_SENT | FLAG_REASSEMBLING)
+              )
               .then(
                   () -> {
                     final ByteBuf followingFrame =
@@ -152,6 +193,10 @@ public class RequestResponseMonoTest {
                     rrm.reassemble(followingFrame, true, false);
                     followingFrame.release();
                   })
+              .then(() ->
+                      Assertions.assertThat(rrm.state)
+                              .isEqualTo(STATE_REQUESTED | FLAG_SENT | FLAG_REASSEMBLING)
+              )
               .then(
                   () -> {
                     final ByteBuf followingFrame =
@@ -165,6 +210,11 @@ public class RequestResponseMonoTest {
                     rrm.reassemble(followingFrame, true, false);
                     followingFrame.release();
                   })
+
+              .then(() ->
+                      Assertions.assertThat(rrm.state)
+                              .isEqualTo(STATE_REQUESTED | FLAG_SENT | FLAG_REASSEMBLING)
+              )
               .then(
                   () -> {
                     final ByteBuf followingFrame =
@@ -178,6 +228,11 @@ public class RequestResponseMonoTest {
                     rrm.reassemble(followingFrame, false, false);
                     followingFrame.release();
                   })
+
+              .then(() ->
+                      Assertions.assertThat(rrm.state)
+                              .isEqualTo(STATE_TERMINATED)
+              )
               .assertNext(
                   p -> {
                     Assertions.assertThat(p.data()).isEqualTo(Unpooled.wrappedBuffer(data));
@@ -217,16 +272,28 @@ public class RequestResponseMonoTest {
                         rrm.reassemble(fragments[0], true, false);
                         fragments[0].release();
                       })
+                      .then(() ->
+                              Assertions.assertThat(rrm.state)
+                                      .isEqualTo(STATE_REQUESTED | FLAG_SENT | FLAG_REASSEMBLING)
+                      )
                   .then(
                       () -> {
                         rrm.reassemble(fragments[1], true, false);
                         fragments[1].release();
                       })
+                      .then(() ->
+                              Assertions.assertThat(rrm.state)
+                                      .isEqualTo(STATE_REQUESTED | FLAG_SENT | FLAG_REASSEMBLING)
+                      )
                   .then(
                       () -> {
                         rrm.reassemble(fragments[2], true, false);
                         fragments[2].release();
                       })
+                      .then(() ->
+                              Assertions.assertThat(rrm.state)
+                                      .isEqualTo(STATE_REQUESTED | FLAG_SENT | FLAG_REASSEMBLING)
+                      )
                   .then(payload::release)
                   .thenCancel()
                   .verifyLater();
@@ -239,6 +306,14 @@ public class RequestResponseMonoTest {
         });
   }
 
+  /**
+   * General StateMachine transition test.
+   * Fragmentation enabled
+   * In this test we check that the given instance of RequestResponseMono:
+   *  1) subscribes
+   *  2) sends fragments frames on the first request
+   *  3) terminates up on receiving the first signal (terminates on first next | error | next over reassembly | complete)
+   */
   @ParameterizedTest
   @MethodSource("frameShouldBeSentOnSubscriptionResponses")
   public void frameFragmentsShouldBeSentOnSubscription(
@@ -264,6 +339,9 @@ public class RequestResponseMonoTest {
             sender,
             PayloadDecoder.ZERO_COPY);
 
+
+    Assertions.assertThat(requestResponseMono.state)
+            .isEqualTo(RequestResponseMono.STATE_UNSUBSCRIBED);
     Assertions.assertThat(activeStreams).isEmpty();
 
     transformer
@@ -271,9 +349,17 @@ public class RequestResponseMonoTest {
             requestResponseMono,
             StepVerifier.create(requestResponseMono, 0)
                 .expectSubscription()
+                .then(() ->
+                        Assertions.assertThat(requestResponseMono.state)
+                                .isEqualTo(RequestResponseMono.STATE_SUBSCRIBED)
+                )
                 .then(() -> Assertions.assertThat(payload.refCnt()).isOne())
                 .then(() -> Assertions.assertThat(activeStreams).isEmpty())
                 .thenRequest(1)
+                .then(() ->
+                        Assertions.assertThat(requestResponseMono.state)
+                                .isEqualTo(STATE_REQUESTED | FLAG_SENT)
+                )
                 .then(() -> Assertions.assertThat(payload.refCnt()).isZero())
                 .then(
                     () ->
@@ -348,6 +434,8 @@ public class RequestResponseMonoTest {
           .hasStreamId(1);
     }
     Assertions.assertThat(sender).isEmpty();
+    Assertions.assertThat(requestResponseMono.state)
+            .isEqualTo(STATE_TERMINATED);
   }
 
   @ParameterizedTest
@@ -370,10 +458,14 @@ public class RequestResponseMonoTest {
             sender,
             PayloadDecoder.ZERO_COPY);
 
+    Assertions.assertThat(requestResponseMono.state)
+            .isEqualTo(STATE_UNSUBSCRIBED);
     Assertions.assertThat(activeStreams).isEmpty();
 
     monoConsumer.accept(requestResponseMono);
 
+    Assertions.assertThat(requestResponseMono.state)
+            .isEqualTo(STATE_TERMINATED);
     Assertions.assertThat(activeStreams).isEmpty();
     Assertions.assertThat(sender).isEmpty();
   }
